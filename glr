@@ -258,7 +258,7 @@ def main():
                                           rootproject['ssh_url_to_repo']))
             configitems.extend([itemtemplate % (prj['path'],
                                                 prj['ssh_url_to_repo'])
-                                for prj in projects])
+                                for prj in projects if prj != rootproject])
             print '\n\n'.join(configitems)
 
     elif args.subparser == 'create':
