@@ -216,12 +216,12 @@ def main():
 
     glr = GitlabRemote(lab)
 
-    group = config.get('General', 'default group')
-
     # Explicitly check against None to allow specifying empty string
     # on the command-line to override 'default group' setting
     if args.group != None:
         group = args.group
+    else:
+        group = config.get('General', 'default group')
 
     visibility = config.get('General', 'default visibility level')
 
