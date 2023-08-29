@@ -1,11 +1,14 @@
-#! /usr/bin/env python
+#!/usr/bin/python3
 # -*- mode: python; coding: utf-8 -*-
 #
 # glr - Gitlab Remote
 #
-# Copyright (C) 2014 Elmar Hoffmann
+# Copyright (C) 2014,2023 Elmar Hoffmann
 #
-#Commandline interface for gitlab to easily work with multiple repositories
+# Commandline interface for gitlab to easily work with multiple repositories
+#
+# Requires Python 3, python-gitlab available from
+# https://github.com/python-gitlab/python-gitlab/
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -30,26 +33,28 @@ import stat
 import errno
 import logging
 import argparse
-import ConfigParser
+import configparser
 
 import gitlab
-import requests
+from gitlab import Gitlab
+from gitlab.config import GitlabDataError
+from gitlab.exceptions import GitlabCreateError, GitlabHttpError, GitlabListError
+from requests.exceptions import ConnectionError, RequestException
 
 
-__version__ = '0.1'
+__version__ = '0.9'
 
 CONFIG_USER='~/.gitlab-remote'
 
 
-class Config(ConfigParser.RawConfigParser):
+class Config(configparser.RawConfigParser):
     def __init__(self):
-        ConfigParser.RawConfigParser.__init__(self)
+        configparser.RawConfigParser.__init__(self)
 
         self.logger = logging.getLogger(str(self.__class__))
 
         self.add_section('Gitlab')
-        self.set('Gitlab', 'host', '')
-        self.set('Gitlab', 'private token', '')
+        self.set('Gitlab', 'instance', '')
 
         self.add_section('General')
         self.set('General', 'default group', '')
@@ -58,23 +63,36 @@ class Config(ConfigParser.RawConfigParser):
         self.add_section('mr')
         self.set('mr', 'root project', '')
 
-        if not self.load_config(CONFIG_USER):
+        config_exists = self.load_config(CONFIG_USER)
+        legacy_host = self.get('Gitlab', 'host', fallback=False)
+
+        if legacy_host:
+            self.logger.warning('Legacy host and and token configuration found in'
+                                'configuration file \'%s\'.\nPlease configure an'
+                                ' according instance in \'~/.python-gitlab.cfg\''
+                                ' instead.', CONFIG_USER)
+
+        # Write default config if it does not exist, or rewrite config, if
+        # legacy options were found, to ensure current options are present.
+        if not config_exists or legacy_host:
             self.save_config(CONFIG_USER)
 
     def load_config(self, filename):
         try:
-            fp = open(os.path.expanduser(filename))
-        except IOError, err:
+            fp = open(os.path.expanduser(filename), encoding='utf-8')
+        except IOError as err:
             if err.errno == errno.ENOENT:
-                self.logger.debug('Configuration file \'%s\' does not exist.'
-                                  % filename)
+                self.logger.debug('Configuration file \'%s\' does not exist.',
+                                  filename)
                 return False
-            raise ConfigException('Error reading configuration file: %s' % err)
-        self.logger.debug('Reading configuration file \'%s\'...' % filename)
+            raise ConfigException('Error reading configuration file: %s'
+                                  % err) from err
+        self.logger.debug('Reading configuration file \'%s\'...', filename)
         try:
-            self.readfp(fp, filename)
-        except ConfigParser.Error, err:
-            raise ConfigException('Error parsing configuration file: %s' % err)
+            self.read_file(fp, source=filename)
+        except configparser.Error as err:
+            raise ConfigException('Error parsing configuration file: %s'
+                                  % err) from err
         finally:
             fp.close()
         return True
@@ -89,26 +107,28 @@ class Config(ConfigParser.RawConfigParser):
 
         try:
             os.makedirs(config_dir)
-        except OSError, err:
+        except OSError as err:
             if err.errno != errno.EEXIST:
-                raise ConfigException, 'Error creating configuration' \
-                    ' directory: %s' % err
+                raise ConfigException('Error creating configuration' \
+                    ' directory: %s' % err) from err
         else:
-            self.logger.debug('Created configuration directory \'%s\'...'
-                              % display_config_dir)
+            self.logger.debug('Created configuration directory \'%s\'...',
+                              display_config_dir)
 
-        self.logger.debug('Writing configuration file \'%s\'...'
-                          % display_filename)
+        self.logger.debug('Writing configuration file \'%s\'...',
+                          display_filename)
         try:
             fd = os.open(filename, os.O_WRONLY | os.O_CREAT,
                              stat.S_IRUSR | stat.S_IWUSR)
-            fp = os.fdopen(fd, 'wb')
-        except (OSError, IOError), err:
-            raise ConfigException, 'Error creating configuration file: %s' % err
+            fp = os.fdopen(fd, 'w')
+        except (OSError, IOError) as err:
+            raise ConfigException('Error creating configuration file: %s'
+                                  % err) from err
         try:
             self.write(fp)
-        except IOError, err:
-            raise ConfigException, 'Error writing configuration file: %s' % err
+        except IOError as err:
+            raise ConfigException('Error writing configuration file: %s'
+                                  % err) from err
         finally:
             fp.close()
 
@@ -119,36 +139,85 @@ class ConfigException(Exception):
         return self.value
 
 class GitlabRemote:
-    def __init__(self, gitlab):
-        self.logger = logging.getLogger(str(self.__class__))
+    def __init__(self, instance=None, debug_gitlab=False):
+        self.logger = logging.getLogger()
+        self.instance = instance
+        self.gitlab = Gitlab.from_config(self.instance)
 
-        self.gitlab = gitlab
+        self.logger.info('Querying GitLab instance \'%s\': %s',
+                         self.instance, self.gitlab.url)
+
+        if debug_gitlab:
+            self.gitlab.enable_debug()
+
+        self.gitlab.auth()
+        self.logger.info('Authenticated as user %s (ID %d).',
+                         self.gitlab.user.username, self.gitlab.user.id)
+
+    def getgroups(self, group, count=False):
+        self.logger.debug('Getting group \'%s\'...', group)
+        groups = self.gitlab.groups.list(search=group, iterator=False,
+                                         get_all=True, order_by='name')
+
+        if count or logging.root.level <= logging.DEBUG:
+            numgroups = len(groups)
+            self.logger.debug('Got %d group results.', numgroups)
+
+        if count:                               # pylint: disable=no-else-return
+            return groups, numgroups
+        else:
+            return groups
 
     def getgroupid(self, group):
-        # The braindead GitLab API uses pagination with a maximum of
-        # 100 entries per page
-        i = 1
-        while True:
-            groups = self.gitlab.getgroups(page=i, per_page=100)
-            if not groups:
-                break
-            for g in groups:
-                if g['path'] == group:
-                    return g['id']
-            i += 1
+        groups, count = self.getgroups(group, count=True)
+        if count > 1:
+            self.logger.warning(
+                'Search for group \'%s\' returned %d groups instead of 1!',
+                group, count
+            )
+
+        if count > 0:
+            return groups[0].id
+
         return None
 
-    def getprojects(self):
-        # The braindead GitLab API uses pagination with a maximum of 100
-        # entries per page
-        projects = []
-        i = 1
-        while True:
-            page = self.gitlab.getprojects(page=i, per_page=100)
-            if not page:
-                break
-            projects += page
-            i += 1
+    def getnspath(self, gitlabobject):
+        if isinstance(gitlabobject, gitlab.v4.objects.groups.Group):
+            return gitlabobject.path
+        if isinstance(gitlabobject, gitlab.v4.objects.users.User):
+            return gitlabobject.username
+        raise TypeError('Object of type %s is unsupported' % type(gitlabobject))
+
+    def createproject(self, name, group=None, visibility='private'):
+        project_params = {
+                'name': name,
+                'visibility': visibility
+        }
+        if group is not None:
+            project_params['namespace_id'] = self.getgroupid(group)
+        project = self.gitlab.projects.create(project_params)
+        return project
+
+    def getprojects(self, group=None):
+        if group:
+            objects = self.getgroups(group)
+
+            if not objects:
+                # Fall back to searching users, as the API does treat the
+                # personal projects group special
+                objects = self.gitlab.users.list(search=group, iterator=False,
+                                               get_all=True, order_by='name')
+
+            projects = set()
+            for obj in objects:
+                self.logger.debug('Getting projects in namespace \'%s\'...',
+                                  self.getnspath(obj))
+                projects.update(set(obj.projects.list(iterator=True, get_all=True)))
+        else:
+            self.logger.debug('Getting all projects...')
+            projects = self.gitlab.projects.list(iterator=True, get_all=True)
+
+        self.logger.debug('Got %d projects.', len(projects))
         return projects
 
 def main():
@@ -158,7 +227,7 @@ def main():
 
     try:
         config = Config()
-    except ConfigException, err:
+    except ConfigException as err:
         logger.error(err)
         sys.exit(1)
 
@@ -196,7 +265,7 @@ def main():
                                      nargs='+', help='repository to create')
 
     for p in subparser.values():
-        p.add_argument('-g', '--group', action='store', type=unicode,
+        p.add_argument('-g', '--group', action='store', type=str,
                        help='process projects in this group')
 
 
@@ -208,17 +277,20 @@ def main():
         logger.setLevel(logging.DEBUG)
 
 
-    host = config.get('Gitlab', 'host')
-    if not host:
-        logger.error('No GitLab hostname given!')
+    instance = config.get('Gitlab', 'instance', fallback=None)
+    if instance:
+        try:
+            glr = GitlabRemote(instance)
+        except (ConnectionError, GitlabDataError) as err:
+            logger.error('Can not connect to GitLab: %s', err)
+            sys.exit(1)
+    else:
+        logger.error('No GitLab instance given!')
         sys.exit(1)
-    lab = gitlab.Gitlab(host, token=config.get('Gitlab', 'private token'))
-
-    glr = GitlabRemote(lab)
 
     # Explicitly check against None to allow specifying empty string
     # on the command-line to override 'default group' setting
-    if args.group != None:
+    if args.group is not None:
         group = args.group
     else:
         group = config.get('General', 'default group')
@@ -227,57 +299,68 @@ def main():
 
     if args.subparser in ('list', 'mrconfig'):
         try:
-            allprojects = glr.getprojects()
-        except requests.exceptions.RequestException, err:
-            logger.error('Can not connect to GitLab: %s' % err)
+            projects = glr.getprojects(group)
+        except (RequestException, GitlabHttpError) as err:
+            logger.error('Can not connect to GitLab: %s', err)
             sys.exit(1)
+        except GitlabListError as err:
+            logger.error('Error getting projects: %s', err)
 
         rootpath = config.get('mr', 'root project')
         rootproject = None
 
-        prjs = []
-        for prj in allprojects:
-             if prj['path'] == rootpath:
-                 rootproject = prj
-                 continue
-             if not group or prj['namespace']['path'] == group:
-                 prjs.append(prj)
+        if rootpath:
+            for prj in projects:
+                if prj.path == rootpath:
+                    rootproject = prj
+                    break
 
-        projects = sorted(prjs, key=lambda p: p['path'].lower())
+        projects = sorted(projects, key=lambda p: p.path.lower())
 
         if args.subparser == 'list':
             for prj in projects:
-                print prj['path']
+                print(prj.path)
         elif args.subparser == 'mrconfig':
             itemtemplate = '[%s]\ncheckout = git clone \'%s\''
             configitems = []
             if rootproject:
-                rootpath = rootproject['path']
+                rootpath = rootproject.path
                 configitems.append(itemtemplate \
                                        % ('.',
-                                          rootproject['ssh_url_to_repo']))
-            configitems.extend([itemtemplate % (prj['path'],
-                                                prj['ssh_url_to_repo'])
+                                          rootproject.ssh_url_to_repo))
+            configitems.extend([itemtemplate % (prj.path,
+                                                prj.ssh_url_to_repo)
                                 for prj in projects if prj != rootproject])
-            print '\n\n'.join(configitems)
+            print('\n\n'.join(configitems))
 
     elif args.subparser == 'create':
-        if group:
-            try:
-                ns = glr.getgroupid(group)
-            except requests.exceptions.RequestException, err:
-                logger.error('Can not connect to GitLab: %s' % err)
         for name in args.repositories:
-            logger.info('Creating project \'%s\'%s...'
-                        % (name, group and ' in group \'%s\'' % group or ''))
-            if not lab.createproject(name, namespace_id=ns,
-                                     visibility_level=visibility):
-                logger.error('Could not create project \'%s\'.' % name)
+            if group:
+                logger.info('Creating project \'%s\' in group \'%s\'...',
+                            name, group)
+            else:
+                logger.info('Creating project \'%s\'...', name)
+
+            project = None
+            try:
+                project = glr.createproject(name, group=group,
+                                            visibility=visibility)
+            except RequestException as err:
+                logger.error('Can not connect to GitLab: %s', err)
+            except GitlabCreateError as err:
+                logger.error('Could not create project \'%s\': %s', name, err)
+
+            if project:
+                logger.info('Created project \'%s\': %s', project.name, project.web_url)
+            else:
+                logger.error('Could not create project \'%s\'.', name)
 
     sys.exit(os.EX_OK)
 
+
 class UsageAction(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):
+    def __call__(self, parser, namespace,
+                 values, option_string=None):
         parser.print_usage()
         parser.exit(os.EX_USAGE)
 
