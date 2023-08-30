@@ -139,9 +139,10 @@ class ConfigException(Exception):
         return self.value
 
 class GitlabRemote:
-    def __init__(self, instance=None, debug_gitlab=False):
+    def __init__(self, instance=None, no_namespace=False, debug_gitlab=False):
         self.logger = logging.getLogger()
         self.instance = instance
+        self.no_namespace = no_namespace
         self.gitlab = Gitlab.from_config(self.instance)
 
         self.logger.info('Querying GitLab instance \'%s\': %s',
@@ -189,10 +190,20 @@ class GitlabRemote:
         return None
 
     def getnspath(self, gitlabobject):
+        if isinstance(gitlabobject, gitlab.v4.objects.projects.Project) \
+           or isinstance(gitlabobject, gitlab.v4.objects.projects.GroupProject) \
+           or isinstance(gitlabobject, gitlab.v4.objects.users.UserProject):
+            if self.no_namespace:
+                return gitlabobject.path
+            else:
+                return gitlabobject.path_with_namespace
+
         if isinstance(gitlabobject, gitlab.v4.objects.groups.Group):
             return gitlabobject.path
+
         if isinstance(gitlabobject, gitlab.v4.objects.users.User):
             return gitlabobject.username
+
         raise TypeError('Object of type %s is unsupported' % type(gitlabobject))
 
     def createproject(self, name, group=None, visibility='private'):
@@ -220,7 +231,7 @@ class GitlabRemote:
                             return True
                 except GitlabListError:
                     self.logger.info('Project \'%s\' has no repository, skipping.',
-                                     project.path)
+                                     self.getnspath(project))
 
             return False
 
@@ -284,6 +295,9 @@ def main():
 
     parser.add_argument('-i', '--instance', action='store', type=str,
                         help='GitLab instance to query')
+    parser.add_argument('-n', '--no-namespace', '--without-namespace',
+                        action='store_true',
+                        help='sist project names without namespace path')
 
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='show verbose output')
@@ -330,7 +344,7 @@ def main():
         instance = config.get('Gitlab', 'instance', fallback=None)
     if instance:
         try:
-            glr = GitlabRemote(instance)
+            glr = GitlabRemote(instance, args.no_namespace)
         except (ConnectionError, GitlabDataError) as err:
             logger.error('Can not connect to GitLab: %s', err)
             sys.exit(1)
@@ -378,11 +392,11 @@ def main():
                     rootproject = prj
                     break
 
-        projects = sorted(projects, key=lambda p: p.path.lower())
+        projects = sorted(projects, key=lambda p: glr.getnspath(p).lower())
 
         if args.subparser == 'list':
             for prj in projects:
-                print(prj.path)
+                print(glr.getnspath(prj))
         elif args.subparser == 'mrconfig':
             itemtemplate = '[%s]\ncheckout = git clone \'%s\''
             configitems = []
