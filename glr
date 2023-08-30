@@ -154,6 +154,13 @@ class GitlabRemote:
         self.logger.info('Authenticated as user %s (ID %d).',
                          self.gitlab.user.username, self.gitlab.user.id)
 
+    def getuser(self):
+        return self.gitlab.user
+
+    def getemails(self):
+        emails = self.gitlab.user.emails.list(iterator=False, get_all=True)
+        return {email.email for email in emails}
+
     def getgroups(self, group, count=False):
         self.logger.debug('Getting group \'%s\'...', group)
         groups = self.gitlab.groups.list(search=group, iterator=False,
@@ -198,7 +205,25 @@ class GitlabRemote:
         project = self.gitlab.projects.create(project_params)
         return project
 
-    def getprojects(self, group=None):
+    def getprojects(self, group=None, user=None, committers=None):
+        def filterprojett(project):
+            if user and project.creator_id == user.id:
+                return True
+            if committers:
+                if isinstance(project, gitlab.v4.objects.projects.GroupProject):
+                    # GroupProject does not support the commits attribute,
+                    # thus get real Project instead
+                    project = self.gitlab.projects.get(project.id)
+                try:
+                    for commit in project.commits.list(iterator=True, get_all=True):
+                        if commit.committer_email in committers:
+                            return True
+                except GitlabListError:
+                    self.logger.info('Project \'%s\' has no repository, skipping.',
+                                     project.path)
+
+            return False
+
         if group:
             objects = self.getgroups(group)
 
@@ -216,6 +241,19 @@ class GitlabRemote:
         else:
             self.logger.debug('Getting all projects...')
             projects = self.gitlab.projects.list(iterator=True, get_all=True)
+
+        if user or committers:
+            if self.logger.level <= logging.DEBUG:
+                filters = []
+                if user:
+                    filters.append('user')
+                if committers:
+                    filters.append('committers')
+                self.logger.debug('Filtering projects by %s...', ' and '.join(filters))
+
+            # Flatten filter iterator to set object, to ensure funcitons
+            # such as len() can be used on the result
+            projects = set(filter(filterprojett, projects))
 
         self.logger.debug('Got %d projects.', len(projects))
         return projects
@@ -256,6 +294,12 @@ def main():
     subparser = {}
 
     subparser['list'] = subparsers.add_parser('list', help='list repositories')
+    subparser['list'].add_argument('--own',
+                                   action='store_true',
+                                   help='list repositories started by yeurself')
+    subparser['list'].add_argument('--contributed', '--own-commits',
+                                   action='store_true',
+                                   help='list repositories having commits by yeurself')
 
     subparser['mrconfig'] = \
         subparsers.add_parser('mrconfig',
@@ -294,18 +338,31 @@ def main():
         logger.error('No GitLab instance given!')
         sys.exit(1)
 
-    # Explicitly check against None to allow specifying empty string
-    # on the command-line to override 'default group' setting
-    if args.group is not None:
-        group = args.group
+    group = None
+    user = None
+    committers = None
+    if args.subparser == 'list' and (args.own or args.contributed):
+        if args.own:
+            user = glr.getuser()
+        if args.contributed:
+            committers = glr.getemails()
+            logger.info('Found the following email addresses:')
+            for email in committers:
+                logger.info('    %s', email)
     else:
         group = config.get('General', 'default group')
+
+    if args.subparser in ('create', 'list', 'mrconfig'):
+        # Explicitly check against None to allow specifying empty string
+        # on the command-line to override 'default group' setting
+        if args.group is not None:
+            group = args.group
 
     visibility = config.get('General', 'default visibility level')
 
     if args.subparser in ('list', 'mrconfig'):
         try:
-            projects = glr.getprojects(group)
+            projects = glr.getprojects(group, user=user, committers=committers)
         except (RequestException, GitlabHttpError) as err:
             logger.error('Can not connect to GitLab: %s', err)
             sys.exit(1)
