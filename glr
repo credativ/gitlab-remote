@@ -244,6 +244,9 @@ def main():
                               version='%(prog)s ' + __version__,
                               help='print version information and exit')
 
+    parser.add_argument('-i', '--instance', action='store', type=str,
+                        help='GitLab instance to query')
+
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='show verbose output')
     parser.add_argument('--debug', action='store_true',
@@ -277,7 +280,10 @@ def main():
         logger.setLevel(logging.DEBUG)
 
 
-    instance = config.get('Gitlab', 'instance', fallback=None)
+    if args.instance:
+        instance = args.instance
+    else:
+        instance = config.get('Gitlab', 'instance', fallback=None)
     if instance:
         try:
             glr = GitlabRemote(instance)
